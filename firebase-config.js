@@ -1,30 +1,18 @@
-/* BAND APP – nastavení Kamarádek pro SKUTEČNOU (veřejnou) BAND APP, produkční projekt Firebase band-app-7c9ca.
- * ⚠️ Sem patří jen údaje PRODUKČNÍHO projektu band-app-7c9ca. Nikdy ne testovacího projektu (band-app-test-…):
- *    pojistka ve friends.js veřejnou aplikaci s testovacím projektem nespustí.
- *
- * Tyto údaje NEJSOU tajné: Firebase je navrhl tak, aby byly vidět ve webové stránce.
- * Data před jinými uživatelkami a cizími chrání bezpečnostní pravidla (firestore.rules) a App Check, ne tento soubor.
- * Zprávy nejsou koncově šifrované: vlastník/správce projektu Firebase a Google k nim mají technický přístup.
- * Obnovovací kódy sem NEPATŘÍ – nikam se neukládají.
- * NIKDY sem nevkládej heslo, soukromý klíč, tajný klíč reCAPTCHA ani "service account" JSON.
- *
- * ✅ VYPLNĚNO (1p-final, 18. 10. 2026): webová konfigurace produkčního projektu band-app-7c9ca
- *    (doplněno nástrojem tools/fill-config.sh; shoda s webConfig projektu ověřena jen čtením).
- *    Kamarádky se připojí k Firebase teprve, když je uživatelka otevře. Zbytek BAND APP funguje jako dřív.
- *    Obnovovací kód zůstává VYPNUTÝ (RECOVERY_DOMAIN_VERIFIED = false níže).
- */
+/* NÁHLED 1.2.0: TESTOVACÍ projekt Firebase band-app-test-9fc3e (žádná produkční data). NIKDY nenahrávat do band-app. */
+/* Platí: TEST_BUILD = true + projekt band-app-test-9fc3e. Pojistka ve friends.js pustí tuto stránku jen k projektu s „test“ v ID;
+ * veřejná BAND APP by tento soubor odmítla. Údaje webové aplikace nejsou tajné (chrání je pravidla Firestore). */
 export const FIREBASE_CONFIGURED = true;
 
 /* Veřejná BAND APP = false. Neměň. (Testovací balíček má true; aplikace odmítne běžet, když se soubory spletou.) */
-export const TEST_BUILD = false;
+export const TEST_BUILD = true;
 
 export const firebaseConfig = {
-  apiKey: "AIzaSyAj1r6xgNHi4VzReqKOkxMOzv2uYfXmzUo",
-  authDomain: "band-app-7c9ca.firebaseapp.com",
-  projectId: "band-app-7c9ca",
-  storageBucket: "band-app-7c9ca.firebasestorage.app",
-  messagingSenderId: "604912868883",
-  appId: "1:604912868883:web:9f62d14ecf25ba6a7c29e6"
+  apiKey: "AIzaSyAyjDKn7Fn4v9pzw3hu5IVt8dXKpLy3jS0",
+  authDomain: "band-app-test-9fc3e.firebaseapp.com",
+  projectId: "band-app-test-9fc3e",
+  storageBucket: "band-app-test-9fc3e.firebasestorage.app",
+  messagingSenderId: "606696541917",
+  appId: "1:606696541917:web:873c4b4b76002698ea9534"
 };
 
 /* App Check (ochrana proti zneužití cizími skripty). Volitelné.
