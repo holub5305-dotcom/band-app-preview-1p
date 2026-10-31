@@ -1,4 +1,4 @@
-/* NÁHLED 1.2.0: TESTOVACÍ projekt Firebase band-app-test-9fc3e (žádná produkční data). NIKDY nenahrávat do band-app. */
+/* NÁHLED 1.3.0: TESTOVACÍ projekt Firebase band-app-test-9fc3e (žádná produkční data). NIKDY nenahrávat do band-app. */
 /* Platí: TEST_BUILD = true + projekt band-app-test-9fc3e. Pojistka ve friends.js pustí tuto stránku jen k projektu s „test“ v ID;
  * veřejná BAND APP by tento soubor odmítla. Údaje webové aplikace nejsou tajné (chrání je pravidla Firestore). */
 export const FIREBASE_CONFIGURED = true;

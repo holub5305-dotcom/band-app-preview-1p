@@ -203,17 +203,51 @@ export async function checkSession() {
   try { await u.getIdToken(true); return true; }
   catch (e) { return !/user-token-expired|user-disabled|user-not-found|invalid-user-token|token-expired/.test((e && e.code) || ''); }
 }
+/* 1.2.2: Firebase BEZ přihlašování – jen načte SDK a obnoví uložené přihlášení (authStateReady).
+ * Nový (anonymní) účet nikdy nezakládá; to dělá jen connect() po výslovné akci (Kamarádky, pozvánka). */
+export async function firebaseBase() { return base(); }
+/* „Kód účtu“ (1.2.2 „Kód zařízení“): prvních 6 znaků SHA-256(uid). Uid účtu Firebase se nikdy nemění → kód je stálý,
+ * dokud se používá stejný účet (aktualizace, restart, pozvánky, obnova obnovovacím kódem). NENÍ to heslo – k přihlášení
+ * nestačí; slouží jen k porovnání „je to stejný účet?“ mezi telefonem členky a seznamem u zakladatelky.
+ * Krátký kód: prvních 6 znaků SHA-256(uid). Z kódu nejde uid zjistit; slouží jen k porovnání
+ * „je tohle stejné přihlášení?“ mezi telefonem a seznamem členek u zakladatelky. */
+export async function deviceCode(uid) {
+  if (!uid) return '';
+  try { const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(uid)));
+    return [...new Uint8Array(d)].slice(0, 3).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase(); } catch (e) { return ''; }
+}
 export async function connect() {
   const fb = await base();
   if (!fb.auth.currentUser) {
     if (lockedReason()) throw err('bandapp/signed-out');
-    await (anonp || (anonp = fb.A.signInAnonymously(fb.auth).finally(() => { anonp = null; })));   // začíná se bez e-mailu a hesla
+    // 1.2.3: ŽÁDNÝ samovolný nový účet. Chybí-li přihlášení, aplikace to řekne a nabídne obnovu;
+    // nový účet založí jen createAccount() po výslovném „Založit nový účet“.
+    throw Object.assign(err('bandapp/no-account'), { knownCode: await knownAccountCode() });
   }
+  return finishConnect(fb);
+}
+/* 1.2.3: JEDINÉ místo, kde vzniká nový (anonymní) účet – jen po výslovné akci uživatelky. Je-li už přihlášená, nic nezakládá. */
+export async function createAccount() {
+  const fb = await base();
+  if (!fb.auth.currentUser) {
+    if (lockedReason()) throw err('bandapp/signed-out');
+    await (anonp || (anonp = fb.A.signInAnonymously(fb.auth).finally(() => { anonp = null; })));
+  }
+  const r = await finishConnect(fb);
+  accountChanged();
+  return r;
+}
+/* 1.2.3: po výslovném založení / obnově účtu dá vědět ostatním částem stránky (VIDEOCHAT začne hned naslouchat). */
+function accountChanged() { try { dispatchEvent(new Event('bandapp-account')); } catch (e) { } }
+/* Kód účtu, který byl na tomto zařízení přihlášený dřív (podle místní značky zálohy) – pro varování „nezakládej nový účet“. */
+export async function knownAccountCode() { const u = lsGet('state-uid', null) || lsGet('recoverable-uid', null); return u ? deviceCode(u) : ''; }
+async function finishConnect(fb) {
   if (syncedUid !== fb.uid) {
     syncedUid = fb.uid;
     if (hasCode(fb.auth.currentUser)) markRecoverable(fb);
     await syncState(fb);                                       // záloha kontaktů (nevadí, když selže – zkusí se příště)
-    if (hasCode(fb.auth.currentUser) && !local.rooms().length) await discoverRooms(fb);
+    // 1.2.2: vlastní skupiny ze serveru i pro anonymní účet, když je místní seznam prázdný (jen přidá, nic nemaže).
+    if (!local.rooms().length) await discoverRooms(fb);
   }
   fbReady = fb;
   return fb;
@@ -306,16 +340,53 @@ export async function regenerateCode(oldCode) {
 export async function restoreAccount(input) {
   await requireVerified();
   const c = parseCode(input); if (!c) throw err('bandapp/bad-code');
+  flash('');                                        // 1.2.6: staré oznámení pryč, ať se nesplete s výsledkem tohoto pokusu
   const fb = await base(), email = recoveryEmail(fb, c.id);
-  if (fb.auth.currentUser && codeEmail(fb.auth.currentUser) === email) return { same: true, uid: fb.uid };
-  await fb.A.signInWithEmailAndPassword(fb.auth, email, c.secret);
+  if (fb.auth.currentUser && codeEmail(fb.auth.currentUser) === email) return { same: true, uid: fb.uid, code: await deviceCode(fb.uid) };
+  // 1.2.6: který účet byl na zařízení dřív (přihlášený, nebo podle místní značky) – aby šlo jasně říct, komu kód patří.
+  const prevCode = fb.auth.currentUser ? await deviceCode(fb.auth.currentUser.uid) : await knownAccountCode();
+  try { await fb.A.signInWithEmailAndPassword(fb.auth, email, c.secret); }
+  catch (e) { noteDiagErr('obnova účtu', e); throw e; }
   lsDel('signed-out'); markRecoverable(fb);
   syncedUid = fb.uid;
   const s = await syncState(fb);                    // jiný účet → místní data předchozího účtu se zazálohují v zařízení
   const d = await discoverRooms(fb);                // skupiny i bez zálohy (vlastní členství)
-  fbReady = fb;
-  return { uid: fb.uid, synced: s.ok, found: d.ok ? d.added : null };
+  fbReady = fb; accountChanged();
+  const code = await deviceCode(fb.uid);
+  return { uid: fb.uid, code, prevCode, other: !!prevCode && prevCode !== code, synced: s.ok, found: d.ok ? d.added : null };
 }
+/* 1.2.6: patří kód účtu, který je teď přihlášený? (bez přihlašování – jen porovná ID kódu s adresou účtu) */
+export async function isCurrentCode(input) {
+  const c = parseCode(input); if (!c) return false;
+  const fb = await base().catch(() => null), u = fb && fb.auth.currentUser;
+  return !!u && codeEmail(u) === recoveryEmail(fb, c.id);
+}
+/* 1.2.6: srozumitelný výsledek obnovy – vždy s kódem účtu, kterému obnovovací kód patří. Nic se neslučuje. */
+export function restoreText(r) {
+  if (!r) return '';
+  if (r.same) return '✅ Obnovovací kód patří účtu ' + r.code + ' – ten už je na tomto telefonu přihlášený. Obnova není potřeba.';
+  if (r.other) return '⚠️ Obnovovací kód patří účtu ' + r.code + ', ne účtu ' + r.prevCode + ', který tu byl dřív. Telefon je teď přihlášený jako ' + r.code
+    + '. Nic se nesloučilo ani nesmazalo. Skupiny účtu ' + r.prevCode + ' převede jen zakladatelka (🔁 Převést na nový účet), nebo se k němu vrátíš jeho vlastním obnovovacím kódem.';
+  return '✅ Přihlášeno – účet ' + r.code + ' je obnovený (stejný účet, skupiny i zprávy zůstaly).';
+}
+/* 1.2.6: oznámení nahoře na obrazovce, které přežije překreslení i znovunačtení stránky (do zavření tlačítkem OK). */
+const FLASH_KEY = LS + 'flash';
+export function flash(text) {
+  try { if (text) sessionStorage.setItem(FLASH_KEY, text); else sessionStorage.removeItem(FLASH_KEY); } catch (e) { }
+  showFlash();
+}
+function showFlash() {
+  if (typeof document === 'undefined' || !document.body) return;
+  let text = ''; try { text = sessionStorage.getItem(FLASH_KEY) || ''; } catch (e) { }
+  const old = document.getElementById('frFlash'); if (old) old.remove();
+  if (!text) return;
+  const ok = h('button', { type: 'button', id: 'frFlashOk', style: 'min-height:44px;background:#b3001b;color:#fff;border:0;border-radius:10px;padding:8px 14px;font:inherit;flex:none' }, 'OK');
+  const el = h('div', { id: 'frFlash', role: 'status', 'data-state': /^⚠️/.test(text) ? 'warn' : 'ok', style: 'position:fixed;left:50%;transform:translateX(-50%);top:calc(10px + env(safe-area-inset-top));z-index:10000;width:min(94vw,480px);display:flex;gap:10px;align-items:center;background:#2a0508;color:#fff;border:1px solid #e0202f;border-radius:14px;padding:10px 12px;box-shadow:0 6px 24px #000a;font:15px system-ui,Arial' },
+    h('span', { style: 'flex:1', text }), ok);
+  ok.addEventListener('click', () => flash(''));
+  document.body.append(el);
+}
+if (typeof document !== 'undefined') { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', showFlash); else setTimeout(showFlash, 0); }
 const FR_KEYS = ['rooms', 'nick', 'favorites', 'blocked-names', 'state-uid', 'dirty', 'recoverable-uid', 'signed-out', 'lastread'];   // 1.1: + lastread (jen čtení v tomto zařízení)
 function clearDevice(all) {
   clearTimeout(pushTimer);
@@ -342,7 +413,7 @@ export async function startNewAccount() {
   quiet = true;
   try { backupLocal('nový účet'); clearDevice(false); if (fb.auth.currentUser) await fb.A.signOut(fb.auth); }
   finally { quiet = false; syncedUid = null; fbReady = null; }
-  return connect();
+  return createAccount();
 }
 /* Má současný (jiný) účet v zařízení nějaká data? (varování před přepnutím) */
 export function deviceHasData() { const s = localState(); return !!(s.rooms.length || s.favorites.length || Object.keys(s.blockedNames).length); }
@@ -374,6 +445,10 @@ export async function getInvite(token) {
  * který pozvaná osoba smí udělat (pravidla). Přijetím vzniká jen čekající členka – vstup schvaluje zakladatelka. */
 export async function acceptInvite(token, roomId, nick) {
   const { db, F, uid } = await connect(), iref = F.doc(db, 'invites', token);
+  // 1.2.2: kdo už ve skupině JE (stejný účet, např. po ztrátě místního seznamu), nic nezapisuje – pravidla by
+  // přepis vlastního záznamu odmítla („nedostatečná oprávnění“) a schválení by se stejně nesmělo ztratit.
+  const mine = await F.getDocFromServer(F.doc(db, 'rooms', roomId, 'members', uid)).catch(() => null);
+  if (mine && mine.exists()) throw Object.assign(err('bandapp/already-member'), { status: String(mine.data().status || '') });
   await F.runTransaction(db, async tx => {
     const s = await tx.get(iref);
     if (!s.exists()) throw err('bandapp/invite-missing');
@@ -400,6 +475,19 @@ export async function watchInvites(roomId, cb, onErr) {
   const { db, F } = await connect();
   return F.onSnapshot(F.query(F.collection(db, 'invites'), F.where('roomId', '==', roomId), F.limit(50)),
     s => cb(s.docs.map(d => Object.assign({ token: d.id }, d.data()))), onErr);
+}
+/* 1.2.3: převod členství na nový účet (jen zakladatelka, osobně ověřeno kódem účtu z telefonu členky).
+ * Starý záznam se NEMAŽE: dostane status 'replaced' + replacedBy (nový účet). Nový účet dostane stejnou přezdívku,
+ * status 'approved' a replaces (starý účet). Obojí v jedné dávce – pravidla jinak převod odmítnou. */
+export async function transferMember(roomId, oldUid, newUid, typedCode) {
+  const want = await deviceCode(newUid);
+  if (!want || String(typedCode || '').trim().toUpperCase() !== want) throw err('bandapp/bad-transfer-code');
+  const { db, F } = await connect(), b = F.writeBatch(db);
+  const old = await F.getDocFromServer(F.doc(db, 'rooms', roomId, 'members', oldUid));
+  if (!old.exists() || old.data().status !== 'approved') throw err('permission-denied');
+  b.update(F.doc(db, 'rooms', roomId, 'members', newUid), { status: 'approved', approvedAt: F.serverTimestamp(), nick: old.data().nick, replaces: oldUid });
+  b.update(F.doc(db, 'rooms', roomId, 'members', oldUid), { status: 'replaced', replacedBy: newUid, replacedAt: F.serverTimestamp() });
+  await b.commit();
 }
 export async function approveMember(roomId, uid) { const { db, F } = await connect(); await F.updateDoc(F.doc(db, 'rooms', roomId, 'members', uid), { status: 'approved', approvedAt: F.serverTimestamp() }); }
 export async function removeMember(roomId, uid) { const { db, F } = await connect(); await F.deleteDoc(F.doc(db, 'rooms', roomId, 'members', uid)); }
@@ -429,6 +517,31 @@ export async function sendMessage(roomId, nick, text) {
  * v soukromé záloze a v zařízení. Staré zprávy se nepřepisují; chat ukazuje u každé zprávy AKTUÁLNÍ přezdívku
  * autorky podle seznamu členek. Proti záměně: přezdívku, kterou už má jiná členka v některé z mých skupin
  * (bez ohledu na velikost písmen a mezery), aplikace nedovolí. */
+/* 1.2.3: obrazovka „tento telefon/prohlížeč není přihlášený“ – nikdy nic nezakládá sama.
+ * opts: { known (kód účtu dřív přihlášeného tady), onRestore, onCreate, createLabel, invitePaste } */
+export function noAccountBlock(opts) {
+  const standalone = typeof matchMedia === 'function' && matchMedia('(display-mode: standalone)').matches;
+  const e2 = h('div', { class: 'err', role: 'alert', hidden: true });
+  const kids = [h('h3', { 'data-state': 'no-account', id: 'frNoAccount', text: '🔐 Odhlášeno – obnov účet. Tento ' + (standalone ? 'telefon (nainstalovaná BAND APP)' : 'prohlížeč') + ' není přihlášený k účtu BAND APP' })];
+  if (opts.known) kids.push(h('div', { class: 'warnbox', 'data-state': 'known-account', id: 'frKnownAccount', text: '⚠️ Tady už byl přihlášený účet s kódem ' + opts.known + ', ale přihlášení chybí. NEZAKLÁDEJ nový účet – nový účet by měl jiný kód a do skupiny by tě musela znovu pustit zakladatelka. Obnov svůj účet obnovovacím kódem, nebo používej telefon či prohlížeč, kde jsi s kódem ' + opts.known + ' přihlášená.' }));
+  kids.push(h('p', { class: 'note', text: 'Máš už účet (např. ses přidala přes pozvánku)? Každý prohlížeč a nainstalovaná BAND APP mají VLASTNÍ přihlášení. Na telefonu, kde účet máš, ho zabezpeč (Kamarádky → Můj účet → 🔐 Zabezpečit účet) a tady ho obnov obnovovacím kódem. Kód účtu zůstane stejný.' }));
+  const row = h('div', { class: 'row' });
+  if (opts.onRestore) add(row, btn('primary', '♻️ Mám obnovovací kód', opts.onRestore, { id: 'frNoAccRestore' }));
+  if (opts.onCreate) add(row, btn('secondary', opts.createLabel || '➕ Založit nový účet', async ev => {
+    const b = ev.currentTarget;
+    if (!confirm(opts.known ? 'POZOR: tady už byl účet s kódem ' + opts.known + '. Nový účet bude mít JINÝ kód a nebude v žádné skupině – zakladatelka ho bude muset převést nebo znovu schválit. Opravdu založit NOVÝ účet?'
+      : 'Založit nový účet BAND APP v tomto ' + (standalone ? 'telefonu' : 'prohlížeči') + '? (Pokud už účet jinde máš, zvol radši „Mám obnovovací kód“.)')) return;
+    b.disabled = true; e2.hidden = true;
+    try { await opts.onCreate(); } catch (e) { b.disabled = false; e2.hidden = false; e2.textContent = errText(e); }
+  }, { id: 'frNewAccount', 'data-act': 'create-account' }));
+  kids.push(row, e2);
+  return kids;
+}
+function prevCodeLine(uid) { const el = h('div', { class: 'fstat', 'data-prevcode': '1', text: 'předchozí kód: …' }); deviceCode(uid).then(c => { el.textContent = 'předchozí kód: ' + (c || '–'); }); return el; }
+function codeLine(uid) {   // 1.2.2: jen pro zakladatelku – porovnání s „Kód účtu“ v Diagnostice hovorů u členky
+  const el = h('div', { class: 'fstat', 'data-devcode': '1', text: 'Kód účtu: …' });
+  deviceCode(uid).then(c => { el.textContent = 'Kód účtu: ' + (c || '–'); }); return el;
+}
 export const nickKey = s => cleanNick(s).toLocaleLowerCase('cs');
 async function myMemberships(fb) {
   const { F, db, uid } = fb, out = new Map();
@@ -574,7 +687,13 @@ export async function syncNotifier() {
 export function stopNotifier() { NOTE.subs.forEach(u => { try { u(); } catch (e) { } }); NOTE.subs.clear(); NOTE.unread.clear(); NOTE.seen.clear(); NOTE.msgs.clear(); emitUnread(); }
 if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => { if (visible()) NOTE.active.forEach((on, id) => { if (on) markRead(id); }); });
 
+/* 1.2.6: každá chyba přihlášení Firebase (auth/…) má za českou větou i kategorii chyby (bez tajemství), aby šlo
+ * z fotky obrazovky poznat, co přesně selhalo. */
 function errText(e) {
+  const c = String((e && e.code) || ''), t = errText0(e);
+  return c.startsWith('auth/') ? t + ' (chyba Firebase: ' + c + ')' : t;
+}
+function errText0(e) {
   const c = (e && e.code) || '';
   if (c === 'bandapp/invite-used') return 'Tuto pozvánku mezitím použil někdo jiný. Každá pozvánka platí jen jednou – požádej o novou.';
   if (c === 'bandapp/invite-missing') return 'Pozvánka neexistuje – byla zrušena nebo vypršela.';
@@ -586,6 +705,9 @@ function errText(e) {
   if (c === 'bandapp/no-code') return 'Účet zatím nemá obnovovací kód.';
   if (c === 'bandapp/signed-out') return CHANGED_TEXT;
   if (c === 'bandapp/nick-taken') return 'Tuto přezdívku už má jiná členka ve skupině „' + ((e && e.room) || 'Skupina') + '“. Vyber si jinou, ať si vás nikdo nesplete. Nic se nezměnilo.';
+  if (c === 'bandapp/no-account') return 'Tento telefon (prohlížeč) není přihlášený k žádnému účtu BAND APP.';
+  if (c === 'bandapp/bad-transfer-code') return 'Kód účtu nesouhlasí s kódem tohoto účtu – převod se neprovedl. Opiš kód z jejího telefonu (Kamarádky → Můj účet).';
+  if (c === 'bandapp/already-member') return 'V této skupině už členkou jsi – pozvánku nepotřebuješ.';
   if (c === 'bandapp/nick-empty') return 'Napiš novou přezdívku (1 až 24 znaků).';
   if (c === 'bandapp/offline') return 'Přezdívku jde změnit jen s internetem. Nic se nezměnilo.';
   if (c.startsWith('bandapp/')) return 'Něco se nepovedlo. Nic se nezměnilo, zkus to znovu.';
@@ -600,14 +722,22 @@ function errText(e) {
   if (c === 'auth/weak-password' || c === 'auth/password-does-not-meet-requirements') return 'Firebase má zapnutá zvláštní pravidla pro hesla. Viz návod SETUP-FIREBASE.md (Password policy nech vypnutou).';
   if (c === 'auth/unauthorized-domain') return 'Tato adresa není ve Firebase povolená (Authorized domains). Viz návod SETUP-FIREBASE.md.';
   if (c === 'auth/operation-not-allowed' || c === 'auth/admin-restricted-operation') return 'Ve Firebase není zapnuté přihlášení Email/Password (nebo Anonymous). Viz návod SETUP-FIREBASE.md.';
+  if (c === 'auth/network-request-failed' || c === 'auth/timeout') return 'Firebase teď není dostupný – zkontroluj internet (Wi-Fi nebo mobilní data) a zkus to znovu. Účet ani data se nezměnily.';
+  if (c === 'auth/invalid-api-key' || c.startsWith('auth/api-key-not-valid') || c === 'auth/app-not-authorized' || c === 'auth/invalid-app-credential') return 'Firebase odmítl tuto aplikaci (nastavení projektu). Pošli správci snímek této hlášky.';
+  if (c === 'auth/web-storage-unsupported') return 'Telefon nedovolí uložit přihlášení (úložiště prohlížeče je vypnuté nebo plné).';
+  if (c === 'auth/quota-exceeded') return 'Firebase má teď vyčerpaný limit přihlášení. Zkus to později.';
+  if (c === 'auth/internal-error') return 'Firebase hlásí vnitřní chybu. Zkus to za chvíli znovu.';
   if (c === 'auth/requires-recent-login') return 'Firebase chce čerstvé ověření. Zadej starý kód znovu.';
   if (c.includes('permission-denied')) return 'Nemáš k tomu oprávnění (možná pozvánka vypršela nebo tě zakladatelka skupiny odebrala).';
   if (c.includes('unavailable') || c.includes('network')) return 'Není připojení k internetu. Zkus to znovu.';
   if (c.includes('resource-exhausted') || c.includes('quota')) return 'Dnešní bezplatný limit je vyčerpaný. Zkus to zítra.';
   if (c.includes('failed-precondition') || c.includes('aborted')) return 'Pozvánku mezitím použil někdo jiný nebo se změnila. Zkus to znovu nebo požádej o novou.';
+  if (c.startsWith('auth/')) return 'Přihlášení k Firebase se nepovedlo.';
   return 'Něco se nepovedlo. Zkus to znovu.';
 }
 export { errText };
+/* 1.2.2: poslední chyba pozvánky/přihlášení pro „Diagnostika hovorů“ – jen kód chyby, jen v této relaci (sessionStorage). */
+export function noteDiagErr(where, e) { try { sessionStorage.setItem('bandapp-diag-err', JSON.stringify({ where, code: String((e && e.code) || (e && e.name) || 'neznámá').slice(0, 40), at: Date.now() })); } catch (x) { } }
 
 /* ---------- styl (černočervený, dotykové prvky min. 44 px) ---------- */
 function injectStyle() {
@@ -673,14 +803,17 @@ export function mountChat(el, roomId, getNick, meUid) {
   ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer:fine)').matches) { e.preventDefault(); doSend(); } });
   fill(el, h('div', { class: 'chat' }, list, err, h('div', { class: 'compose' }, ta, send), count,
     h('p', { class: 'note', text: 'Zprávy nejsou koncově šifrované. Starší než 30 dní se nezobrazují.' })));
+  // 1.2.3: zprávy starého účtu po převodu členství patří stejné osobě (replacedBy → nový účet).
+  const cur0 = uid => { let x = who.get(uid), n = 0; while (x && x.status === 'replaced' && x.replacedBy && who.get(x.replacedBy) && n++ < 5) x = who.get(x.replacedBy); return x; };
+  const mine = m => m.uid === meUid || ((cur0(m.uid) || {}).uid === meUid);
   const label = m => {
-    if (m.uid === meUid) return 'Ty';
-    const cur = who.get(m.uid), n = (cur && cur.nick) || m.nick || 'Kamarádka';
+    if (mine(m)) return 'Ty';
+    const cur = cur0(m.uid), n = (cur && cur.nick) || m.nick || 'Kamarádka';
     return cur && cur.status === 'owner' ? n + ' 👑' : n;
   };
   const render = () => {
     const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
-    fill(list, ...(msgs.length ? msgs.map(m => h('div', { class: 'msg' + (m.uid === meUid ? ' me' : ''), 'data-id': m.id, 'data-uid': m.uid || '' },
+    fill(list, ...(msgs.length ? msgs.map(m => h('div', { class: 'msg' + (mine(m) ? ' me' : ''), 'data-id': m.id, 'data-uid': m.uid || '' },
       h('div', { class: 'who', text: label(m) }), h('div', { class: 'mtext', text: m.text == null ? '' : String(m.text) }), h('div', { class: 'when', text: m.pending ? 'odesílám…' : fmtTime(m.at) })))
       : [h('p', { class: 'note', text: 'Zatím tu nejsou žádné zprávy. Napiš první!' })]));
     if (forceBottom || first || atBottom || msgs.length < 15) { list.scrollTop = list.scrollHeight; forceBottom = false; first = false; }
@@ -773,7 +906,7 @@ function confirmSwitch(fb) {
 }
 function accountPanel(onRestored, onSignedOut) {
   const body = h('div', { id: 'frAccountBody' }, h('p', { class: 'note', text: 'Načítám…' }));
-  const box = h('details', { class: 'box', id: 'frAccount' }, h('summary', { text: '🔐 Můj účet a obnovovací kód' }), body);
+  const box = h('details', { class: 'box', id: 'frAccount' }, h('summary', { text: '🔐 Můj účet: kód účtu, zabezpečení a obnova' }), body);
   let loaded = false;
   // Kód se ukáže jen jednou; z obrazovky zmizí po „Hotovo“. Nikam se neukládá.
   const showCode = (code, isNew) => {
@@ -792,12 +925,14 @@ function accountPanel(onRestored, onSignedOut) {
     box.open = true;
   };
   const render = async () => {
-    let fb; try { fb = await connect(); } catch (e) { fill(body, h('div', { class: 'err', role: 'alert', text: 'Nepodařilo se připojit. ' + errText(e) })); loaded = false; return; }
+    let fb; try { fb = await connect(); } catch (e) { fill(body, h('div', { class: e && e.code === 'bandapp/no-account' ? 'note' : 'err', role: 'alert', 'data-state': e && e.code, text: e && e.code === 'bandapp/no-account' ? errText(e) + ' Účet obnovíš obnovovacím kódem (♻️ Mám obnovovací kód).' : 'Nepodařilo se připojit. ' + errText(e) })); loaded = false; return; }
     const info = accountInfo(fb), msg = h('div', { role: 'status', class: 'note', id: 'frAccountMsg' }), e2 = h('div', { class: 'err', role: 'alert', hidden: true });
     const showE = e => { e2.hidden = false; e2.textContent = errText(e); };
+    const myCode = h('p', { class: 'note', id: 'frMyAccountCode', 'data-account-code': '', text: 'Kód účtu: …' });
+    deviceCode(fb.uid).then(c => { myCode.dataset.accountCode = c; myCode.textContent = 'Kód účtu: ' + c + ' – stejný kód vidí zakladatelka skupiny u tvého jména. Je stálý (aktualizace, restart, pozvánky ho nezmění). Není to heslo: k přihlášení nestačí.'; });
     if (!(await recoveryVerified())) {
       // Pojistka: dokud není ve skutečném Firebase ověřené, že obnova funguje, nic se neslibuje a nic nejde spustit.
-      fill(body, h('div', { class: 'warnbox', 'data-state': 'unverified' },
+      fill(body, myCode, h('div', { class: 'warnbox', 'data-state': 'unverified' },
         h('strong', { text: '🔐 Obnovovací kód: Připravuje se – zatím neověřeno' }),
         h('p', { text: UNVERIFIED_TEXT })),
         h('div', { class: 'row' }, btn('secondary', '🔑 Vytvořit obnovovací kód (připravuje se)', null, { id: 'frMakeCode', disabled: true }),
@@ -805,7 +940,7 @@ function accountPanel(onRestored, onSignedOut) {
       return;
     }
     const rem = document.getElementById('frNoCode'); if (rem && info.hasCode) rem.hidden = true;
-    const kids = [];
+    const kids = [myCode];
     if (info.signedOutFrom) kids.push(h('div', { class: 'warnbox', 'data-signedout': '1', text: '⚠️ Tento telefon už není přihlášený do tvého účtu s obnovovacím kódem (například protože sis na jiném telefonu vytvořila nový kód). Zadej svůj platný obnovovací kód níže v „Obnovit účet“.' }));
     if (info.hasCode) {
       // Nový kód VŽDY jen se starým kódem (ověří se u Firebase těsně před změnou). Žádná jiná cesta.
@@ -832,7 +967,7 @@ function accountPanel(onRestored, onSignedOut) {
     } else {
       kids.push(h('div', { class: 'warnbox', 'data-state': 'no-code', text: '⚠️ Zatím nemáš obnovovací kód. Když se smažou data prohlížeče, aplikace se odinstaluje nebo vyměníš telefon, přijdeš o skupinu i kontakty.' }),
         h('p', { class: 'note', text: 'Obnovovací kód je tvůj soukromý klíč k účtu. Nepotřebuješ e-mail ani telefonní číslo. Bez kódu se do tvého účtu v aplikaci nikdo jiný nepřihlásí.' }),
-        h('div', { class: 'row' }, btn('primary', '🔑 Vytvořit obnovovací kód', async ev => {
+        h('div', { class: 'row' }, btn('primary', '🔐 Zabezpečit účet (vytvořit obnovovací kód)', async ev => {
           const b = ev.currentTarget; b.disabled = true; e2.hidden = true;
           try { showCode(await createRecoveryCode(), false); } catch (e) { showE(e); b.disabled = false; }
         }, { id: 'frMakeCode' })));
@@ -844,12 +979,12 @@ function accountPanel(onRestored, onSignedOut) {
       h('div', { class: 'row' }, btn('secondary', '♻️ Obnovit účet', async ev => {
         const b = ev.currentTarget; e2.hidden = true;
         if (!parseCode(inp.value)) return showE({ code: 'bandapp/bad-code' });
-        if (!confirmSwitch(fb)) return;
+        if (!(await isCurrentCode(inp.value)) && !confirmSwitch(fb)) return;
         b.disabled = true;
         try {
-          const r = await restoreAccount(inp.value); inp.value = '';
+          const r = await restoreAccount(inp.value); inp.value = ''; flash(restoreText(r));
           if (!r.same && onRestored) return onRestored();
-          await render(); const m = document.getElementById('frAccountMsg'); if (m) m.textContent = r.same ? 'Tento účet už je na tomto zařízení přihlášený.' : 'Účet je obnovený.';
+          await render(); const m = document.getElementById('frAccountMsg'); if (m) m.textContent = restoreText(r);
         }
         catch (e) { showE(e); b.disabled = false; }
       }, { id: 'frRestore' })),
@@ -899,14 +1034,15 @@ function codeReminder(panel) {
 /* =====================================================================
    Sekce Kamarádky v index.html
    ===================================================================== */
-const STATUS_TEXT = { owner: 'zakladatelka skupiny', approved: 'schválená členka', pending: 'čeká na schválení – zatím nevidí zprávy' };
-const STATUS_ICON = { owner: '👑', approved: '✔', pending: '⏳' };
+const STATUS_TEXT = { owner: 'zakladatelka skupiny', approved: 'schválená členka', pending: 'čeká na schválení – zatím nevidí zprávy', replaced: 'převedeno na nový účet – tento starý účet už do skupiny nemá přístup' };
+const STATUS_ICON = { owner: '👑', approved: '✔', pending: '⏳', replaced: '↪️' };
+const REPLACED_TEXT = '↪️ Členství tohoto účtu bylo převedeno na nový účet. Tento (starý) účet už do skupiny nemá přístup – skupinu používej tam, kde je nový účet. Zprávy zůstaly ve skupině.';
 const czCount = (n, one, few, many) => n + ' ' + (n === 1 ? one : n >= 2 && n <= 4 ? few : many);
 /* 1.1: počty pro kartičky skupin (jen kde smím seznam členek číst = schválená/zakladatelka). Paměť jen pro tuto stránku. */
 const roomStats = new Map();
 async function loadRoomStats(roomId) {
   try { const { db, F } = await connect(); const s = await F.getDocs(F.collection(db, 'rooms', roomId, 'members')); const ms = s.docs.map(d => d.data());
-    const st = { members: ms.filter(m => m && m.status !== 'pending').length, pending: ms.filter(m => m && m.status === 'pending').length }; roomStats.set(roomId, st); return st; }
+    const st = { members: ms.filter(m => m && !['pending', 'replaced'].includes(m.status)).length, pending: ms.filter(m => m && m.status === 'pending').length }; roomStats.set(roomId, st); return st; }
   catch (e) { return null; }
 }
 async function initIndex(root) {
@@ -948,7 +1084,7 @@ async function initIndex(root) {
       let fb = null; try { fb = await base(); } catch (e) { }
       if (mode === 'restore' && !confirmSwitch(fb)) return;
       go.disabled = true;
-      try { await restoreAccount(inp.value); inp.value = ''; open(); }
+      try { const r = await restoreAccount(inp.value); inp.value = ''; flash(restoreText(r)); open(); }
       catch (e) { go.disabled = false; e2.hidden = false; e2.textContent = errText(e); }
     }, { id: 'frRestoreGo', disabled: !verified });
     const fresh = btn('secondary', 'Začít znovu s novým účtem', async () => {
@@ -956,8 +1092,11 @@ async function initIndex(root) {
       fresh.disabled = true;
       try { await startNewAccount(); open(); } catch (e) { fresh.disabled = false; e2.hidden = false; e2.textContent = errText(e); }
     }, { id: 'frFreshAccount' });
-    const head = mode === 'changed' ? [h('h3', { 'data-state': 'code-changed', text: '🔒 ' + CHANGED_TEXT }),
-      h('p', { class: 'note', text: 'Toto zařízení už není přihlášené k tvému účtu. Tvoje skupiny a kamarádky jsou v pořádku – vrátíš se k nim novým kódem.' })]
+    // 1.2.6: „changed“ = zařízení má značku účtu s kódem, ale přihlášení Firebase chybí. Příčinou může být nový kód
+    // na jiném zařízení, ale i ztracené přihlášení v telefonu – proto obecně „Odhlášeno – obnov účet“ + který účet to byl.
+    const known = await knownAccountCode();
+    const head = mode === 'changed' ? [h('h3', { 'data-state': 'code-changed', text: '🔒 Odhlášeno – obnov účet' + (known ? ' ' + known : '') }),
+      h('p', { class: 'note', text: 'Tento telefon už není přihlášený' + (known ? ' k účtu ' + known : '') + '. Stává se to po vytvoření nového kódu na jiném zařízení nebo když telefon smaže uložené přihlášení. Tvoje skupiny, kamarádky a zprávy jsou v pořádku – vrátíš se k nim svým (nejnovějším) obnovovacím kódem. Nový účet nezakládej.' })]
       : mode === 'manual' ? [h('h3', { 'data-state': 'signed-out', text: '🔒 Jsi z tohoto zařízení odhlášená.' }),
       h('p', { class: 'note', text: 'Zpátky se dostaneš jen se svým obnovovacím kódem.' })]
       : [h('h3', { 'data-state': 'restore', text: '♻️ Mám obnovovací kód' }),
@@ -968,6 +1107,16 @@ async function initIndex(root) {
     inp.focus();
   }
 
+  async function noAccount(known) {
+    stopAll();
+    const verified = await recoveryVerified();
+    const inp = h('input', { type: 'url', id: 'frInviteLinkIn', placeholder: 'Mám pozvánku: vlož odkaz (…join.html#t=…)', autocomplete: 'off', 'aria-label': 'Odkaz pozvánky' });
+    const go = btn('secondary', '✉️ Otevřít pozvánku tady', () => { const mm = /[#&]t=([A-Za-z0-9_-]{22})/.exec(inp.value || ''); if (mm) location.href = 'join.html' + location.search + '#t=' + mm[1]; }, { id: 'frInviteLinkGo' });
+    fill(root, ...noAccountBlock({ known, onRestore: verified ? () => restoreScreen('restore') : null,
+      onCreate: async () => { await createAccount(); open(); }, createLabel: known ? '➕ Přesto založit NOVÝ účet' : '➕ Založit můj účet pro Kamarádky' }),
+      h('label', { for: 'frInviteLinkIn', text: 'Dostala jsi pozvánku? Otevři ji přímo tady (ne v prohlížeči):' }), inp, h('div', { class: 'row' }, go),
+      h('p', { class: 'note' }, privacyLink()));
+  }
   function intro() {
     const b = btn('primary', '👯 Otevřít Kamarádky', async () => { b.disabled = true; await open(); b.disabled = false; });
     const has = btn('secondary', '♻️ Mám obnovovací kód', () => restoreScreen('restore'), { id: 'frHaveCode', hidden: true });
@@ -981,12 +1130,22 @@ async function initIndex(root) {
     fill(root, h('p', { class: 'muted', text: 'Připojuji Kamarádky…' }));
     try { await connect(); } catch (e) {
       if (e && e.code === 'bandapp/signed-out') return restoreScreen(lockedReason() || 'changed');
+      if (e && e.code === 'bandapp/no-account') return noAccount(e.knownCode);
       fill(root, h('div', { class: 'err', role: 'alert', text: 'Kamarádky se nepodařilo připojit. Potřebují internet. Ostatní části BAND APP fungují dál.' }), btn('secondary', '↻ Zkusit znovu', open));
       return;
     }
     const rooms = local.rooms();
     if (!rooms.length) return createForm();
     showRoom(rooms.some(r => r.id === S.roomId) ? S.roomId : rooms[rooms.length - 1].id);
+  }
+  /* 1.2.4: přihlášený účet bez skupiny (typicky nainstalovaná aplikace) – pozvánku vložit sem, ne klepnout v Safari. */
+  function inviteJoinBox() {
+    const inp = h('input', { type: 'url', id: 'frJoinLinkIn', placeholder: 'Vlož odkaz pozvánky (…join.html#t=…)', autocomplete: 'off', 'aria-label': 'Odkaz pozvánky' });
+    const e = h('div', { class: 'err', role: 'alert', hidden: true });
+    const go = btn('primary', '✉️ Otevřít pozvánku tady', () => { const mm = /[#&]t=([A-Za-z0-9_-]{22})(?![A-Za-z0-9_-])/.exec(inp.value || ''); if (!mm) { e.hidden = false; e.textContent = 'Tohle nevypadá jako odkaz pozvánky BAND APP.'; return; } location.href = 'join.html' + location.search + '#t=' + mm[1]; }, { id: 'frJoinLinkGo' });
+    return h('div', { class: 'box', id: 'frJoinBox', 'data-state': 'join-or-transfer' }, h('strong', { text: '📩 Mám pozvánku / nový účet – požádat o převod' }),
+      h('p', { class: 'note', text: 'Dostala jsi pozvánku do skupiny? Nebo už ve skupině jsi, ale s jiným přihlášením (jiný telefon, Safari, smazaná data)? Zkopíruj odkaz pozvánky a vlož ho SEM – klepnutí na odkaz ve zprávě ho na iPhonu otevře v Safari, což je jiné přihlášení. Zakladatelka pak tvoje členství převede na tento účet (podle kódu účtu).' }),
+      inp, e, h('div', { class: 'row' }, go));
   }
   function haveCodeBtn() {
     const b = btn('secondary', '♻️ Mám obnovovací kód', () => restoreScreen('restore'), { id: 'frHaveCode', hidden: true });
@@ -1005,7 +1164,7 @@ async function initIndex(root) {
       try { local.setNick(n); const room = await createRoom(r, n); showRoom(room.id); } catch (e) { showErr(err, e); go.disabled = false; }
     }, { id: 'frCreate' });
     const panel = accountPanel(() => open(), afterSignOut);
-    fill(root, codeReminder(panel), h('h3', { text: 'Založ si soukromou skupinu' }),
+    fill(root, codeReminder(panel), inviteJoinBox(), h('h3', { text: 'Založ si soukromou skupinu' }),
       h('label', { for: 'frNick', text: 'Přezdívka (ne celé jméno)' }), nick, h('label', { for: 'frRoomName', text: 'Název skupiny' }), name, err, h('div', { class: 'row' }, go, cancelable && btn('secondary', 'Zpět', () => open())),
       ...privacyLines('Založením skupiny přijímáš pravidla skupiny.'),
       recoveryNote('Máš už účet z jiného zařízení?'), haveCodeBtn(), panel);
@@ -1031,7 +1190,7 @@ async function initIndex(root) {
     };
     const updateCard = () => {
       const c = cardMeta.get(roomId); if (!c || !S.membersOn) return;
-      const st = { members: S.members.filter(m => m.status !== 'pending').length, pending: S.members.filter(m => m.status === 'pending').length };
+      const st = { members: S.members.filter(m => !['pending', 'replaced'].includes(m.status)).length, pending: S.members.filter(m => m.status === 'pending').length };
       roomStats.set(roomId, st); c.r = Object.assign({}, c.r, { role: (S.my && S.my.status) || c.r.role }); fill(c.meta, ...metaText(c.r, st));
     };
     renderGroups();
@@ -1127,20 +1286,20 @@ async function initIndex(root) {
 
     const renderContacts = () => {
       const meUid = S.uid, mgr = isMgr();
-      const others = S.members.filter(m => m.uid !== meUid);
+      const others = S.members.filter(m => m.uid !== meUid && (mgr || m.status !== 'replaced'));
       // 1.1: zakladatelka vidí čekající nahoře (čekají na její rozhodnutí); jinak hvězdičky, zakladatelka, členky.
-      const rank = m => m.status === 'pending' ? (mgr ? -1 : 2) : m.status === 'owner' ? 0 : 1;
+      const rank = m => m.status === 'pending' ? (mgr ? -1 : 2) : m.status === 'owner' ? 0 : m.status === 'replaced' ? 3 : 1;
       others.sort((a, b) => (rank(a) - rank(b)) || (local.isFav(roomId, b.uid) - local.isFav(roomId, a.uid)) || String(a.nick || '').localeCompare(String(b.nick || ''), 'cs'));
       // Stejná přezdívka jako jiná členka (např. pokus vydávat se za někoho) → viditelné upozornění.
-      const keys = new Map(); S.members.forEach(m => { const k = nickKey(m.nick); keys.set(k, (keys.get(k) || 0) + 1); });
+      const keys = new Map(); S.members.filter(m => m.status !== 'replaced').forEach(m => { const k = nickKey(m.nick); keys.set(k, (keys.get(k) || 0) + 1); });
       const pend = others.filter(m => m.status === 'pending').length;
-      contactsTitle.textContent = 'Moje kamarádky (' + others.filter(m => m.status !== 'pending').length + ')' + (mgr && pend ? ' · ⏳ ' + pend + ' čeká na schválení' : '');
+      contactsTitle.textContent = 'Moje kamarádky (' + others.filter(m => !['pending', 'replaced'].includes(m.status)).length + ')' + (mgr && pend ? ' · ⏳ ' + pend + ' čeká na schválení' : '');
       updateCard();
       if (!others.length) { fill(contacts, h('li', { class: 'note', text: mgr ? 'Zatím tu nikdo není. Klepni na „➕ Pozvat kamarádku“.' : 'Zatím tu nikdo další není.' })); }
       else fill(contacts, ...others.map(m => {
         const fav = local.isFav(roomId, m.uid), pending = m.status === 'pending';
         const star = btn('star' + (fav ? ' on' : ''), fav ? '★' : '☆', () => { local.toggleFav(roomId, m.uid); renderContacts(); }, { 'aria-label': fav ? 'Odebrat z oblíbených' : 'Označit jako oblíbenou', 'aria-pressed': String(fav) });
-        const act = h('div', { class: 'row' });
+        let act = h('div', { class: 'row' });
         if (pending && mgr) add(act, btn('primary', '✔ Schválit', async () => { try { await approveMember(roomId, m.uid); } catch (e) { showErr(err, e); } }, { 'data-act': 'approve' }));
         if (['approved', 'owner'].includes(m.status) && canChat()) add(act, btn('secondary', '💬 Chat', openChat, { 'data-act': 'chat' }));
         if (mgr && ['pending', 'approved'].includes(m.status)) {
@@ -1151,12 +1310,64 @@ async function initIndex(root) {
           if (!confirm('Předat vlastnictví skupiny „' + (m.nick || 'Kamarádka') + '“? Ty zůstaneš běžnou členkou a už nebudeš moct zvát, schvalovat ani blokovat.')) return;
           try { await transferOwnership(roomId, m.uid); } catch (e) { showErr(err, e); }
         }, { 'data-act': 'transfer' }));
-        const dup = keys.get(nickKey(m.nick)) > 1;
+        const dup = m.status !== 'replaced' && keys.get(nickKey(m.nick)) > 1;
+        const ownerUid = S.room && S.room.ownerUid;
+        // 1.2.3: převod členství z dřívějšího účtu (ztracené přihlášení) – jen zakladatelka, osobně s kódem účtu.
+        const cands = mgr && ['pending', 'approved'].includes(m.status) && m.uid !== ownerUid
+          ? S.members.filter(x => x.status === 'approved' && x.uid !== m.uid && x.uid !== ownerUid && x.uid !== meUid) : [];
+        let tbox = null;
+        if (cands.length && (pending || dup)) {
+          tbox = h('div', { class: 'box', 'data-transfer-box': '1', hidden: true });
+          add(act, btn('secondary', '🔁 Převést členství z dřívějšího účtu…', () => { tbox.hidden = !tbox.hidden; }, { 'data-act': 'transfer-open' }));
+          const same = cands.filter(x => nickKey(x.nick) === nickKey(m.nick));
+          const sel = h('select', { 'data-transfer-from': '1', 'aria-label': 'Dřívější účet' }, ...(same.length ? same : cands).concat(same.length ? cands.filter(x => !same.includes(x)) : []).map(x => {
+            const o = h('option', { value: x.uid, text: (x.nick || 'Kamarádka') + ' · kód …' }); deviceCode(x.uid).then(c => { o.textContent = (x.nick || 'Kamarádka') + ' · předchozí kód ' + c; }); return o; }));
+          const code = h('input', { type: 'text', 'data-transfer-code': '1', maxlength: 6, autocomplete: 'off', autocapitalize: 'characters', placeholder: 'např. 7DFE2E', 'aria-label': 'Kód účtu z jejího telefonu' });
+          const terr = h('div', { class: 'err', role: 'alert', hidden: true });
+          fill(tbox, h('p', { class: 'note', text: 'Použij jen OSOBNĚ: stůj vedle ní, ať ti na svém telefonu ukáže Kamarádky → Můj účet → „Kód účtu“ (nebo VIDEOCHAT → Diagnostika). Opiš ho sem – musí sedět s kódem této žádosti. Starý záznam se nesmaže, jen se označí jako převedený; zprávy zůstanou.' }),
+            h('label', { text: 'Dřívější účet (přezdívka · předchozí kód):' }), sel, h('label', { text: 'Kód účtu z jejího telefonu:' }), code, terr,
+            h('div', { class: 'row' }, btn('primary', '🔁 Převést členství', async ev => {
+              const b = ev.currentTarget; terr.hidden = true;
+              const from = S.members.find(x => x.uid === sel.value);
+              if (!confirm('Převést členství „' + ((from && from.nick) || 'Kamarádka') + '“ na tento účet? Starý účet ztratí přístup do skupiny (záznam zůstane jako „převedeno“).')) return;
+              b.disabled = true;
+              try { await transferMember(roomId, sel.value, m.uid, code.value); } catch (e) { b.disabled = false; showErr(terr, e); }
+            }, { 'data-act': 'transfer-go' })));
+        }
+        // 1.2.4: převod i ze STARÉHO schváleného záznamu (zakladatelka → „Převést na nový účet…“). Nový účet musí
+        // mít čekající žádost (pozvánka otevřená v nové aplikaci); kód z jejího telefonu se opisuje osobně.
+        if (mgr && m.status === 'approved' && m.uid !== ownerUid && m.uid !== meUid) {
+          const obox = h('div', { class: 'box', 'data-move-box': '1', hidden: true });
+          add(act, btn('secondary', '🔁 Převést na nový účet…', () => { obox.hidden = !obox.hidden; }, { 'data-act': 'move-open' }));
+          const reqs = S.members.filter(x => x.status === 'pending' && x.uid !== m.uid);
+          const who = m.nick || 'Kamarádka';
+          if (!reqs.length) {
+            fill(obox, h('p', { class: 'note', 'data-move-none': '1', text: 'Zatím tu není žádná nová žádost, na kterou jde členství „' + who + '“ převést. Postup: 1) Klepni nahoře na „➕ Pozvat kamarádku“ a pošli „' + who + '“ NOVOU pozvánku. 2) „' + who + '“ odkaz zkopíruje a vloží v NAINSTALOVANÉ BAND APP (Kamarádky → „Mám pozvánku / nový účet – požádat o převod“), zadá přezdívku a klepne na „Požádat o převod“. (Klepnutí na odkaz ve zprávě ho na iPhonu otevře v Safari – to je jiné přihlášení.) 3) Pak tady znovu otevři „🔁 Převést na nový účet…“, vyber žádost a opiš kód účtu z jejího telefonu.' }));
+          } else {
+            const osel = h('select', { 'data-move-to': '1', 'aria-label': 'Nová žádost' }, ...reqs.slice().sort((a, b) => (nickKey(b.nick) === nickKey(m.nick)) - (nickKey(a.nick) === nickKey(m.nick))).map(x => {
+              const o = h('option', { value: x.uid, text: (x.nick || 'Kamarádka') + ' · kód …' }); deviceCode(x.uid).then(c => { o.textContent = (x.nick || 'Kamarádka') + ' · kód účtu ' + c; }); return o; }));
+            const ocode = h('input', { type: 'text', 'data-move-code': '1', maxlength: 6, autocomplete: 'off', autocapitalize: 'characters', placeholder: 'např. 7DFE2E', 'aria-label': 'Kód účtu z jejího telefonu' });
+            const oerr = h('div', { class: 'err', role: 'alert', hidden: true });
+            fill(obox, h('p', { class: 'note', text: 'Jen OSOBNĚ: ať ti „' + who + '“ na svém (novém) telefonu ukáže Kamarádky → Můj účet → „Kód účtu“ (nebo VIDEOCHAT → Diagnostika). Vyber žádost se STEJNÝM kódem a kód opiš. Starý záznam se nesmaže, jen se označí „převedeno“; zprávy zůstanou. Nový účet dostane přezdívku „' + who + '“.' }),
+              h('label', { text: 'Nová žádost (přezdívka · kód účtu):' }), osel, h('label', { text: 'Kód účtu z jejího telefonu:' }), ocode, oerr,
+              h('div', { class: 'row' }, btn('primary', '🔁 Převést členství', async ev => {
+                const b = ev.currentTarget; oerr.hidden = true;
+                if (!confirm('Převést členství „' + who + '“ na vybraný nový účet? Starý účet ztratí přístup do skupiny (záznam zůstane jako „převedeno“).')) return;
+                b.disabled = true;
+                try { await transferMember(roomId, m.uid, osel.value, ocode.value); } catch (e) { b.disabled = false; showErr(oerr, e); }
+              }, { 'data-act': 'move-go' })));
+          }
+          tbox = tbox ? h('div', {}, tbox, obox) : obox;
+        }
+        if (m.status === 'replaced') { act = h('div', { class: 'row' }); }
+        const repl = m.status === 'replaced' && mgr ? h('div', { class: 'fstat', 'data-replaced': '1', text: 'převedeno na: …' }) : null;
+        if (repl) { const nw = S.members.find(x => x.uid === m.replacedBy); deviceCode(m.replacedBy).then(c => { repl.textContent = 'převedeno na: ' + ((nw && nw.nick) || 'nový účet') + ' · kód ' + c; }); }
         return h('li', { 'data-uid': m.uid, 'data-status': m.status }, h('div', { class: 'row', style: 'margin:0' },
           h('span', { class: 'ficon', 'aria-hidden': 'true', text: STATUS_ICON[m.status] || '•' }),
           h('div', { style: 'flex:1;min-width:0' }, h('div', { class: 'fname', text: (m.nick || 'Kamarádka') + (m.status === 'owner' ? ' 👑' : '') }),
             h('div', { class: 'fstat', text: STATUS_TEXT[m.status] || 'členka' }),
-            dup ? h('div', { class: 'dup', 'data-dup': '1', text: '⚠️ Stejnou přezdívku má i jiná členka – ověř si, kdo to je.' }) : null), star), act);
+            dup ? h('div', { class: 'dup', 'data-dup': '1', text: '⚠️ Stejnou přezdívku má i jiná členka – ověř si, kdo to je.' }) : null,
+            mgr ? (m.status === 'replaced' ? prevCodeLine(m.uid) : codeLine(m.uid)) : null, repl), m.status === 'replaced' ? null : star), act, tbox);
       }));
       const bl = (S.room && S.room.blocked) || [];
       if (mgr && bl.length) { const names = local.blockedNames(); fill(blockedBox, h('h4', { text: 'Zablokované' }), h('ul', { class: 'fr-list' }, ...bl.map(u => h('li', {}, h('span', { text: (names[u] || 'neznámá') + ' ' }), btn('secondary', 'Odblokovat', async () => { try { await unblock(roomId, u); } catch (e) { showErr(err, e); } }))))); }
@@ -1177,6 +1388,7 @@ async function initIndex(root) {
       const onMy = my => {
         const prev = role(); S.my = my || null;
         if (my === undefined) { statusP.textContent = 'Jsi offline. Kamarádky se připojí, až bude internet. Ostatní části BAND APP fungují dál.'; return; }
+        if (my && my.status === 'replaced') { if (info.role !== 'replaced') { info.role = 'replaced'; local.saveRoom({ id: roomId, role: 'replaced' }); syncNotifier(); } my = null; S.my = null; statusP.dataset.state = 'replaced'; statusP.textContent = REPLACED_TEXT; nickRow.hidden = true; ned.box.hidden = true; err.hidden = true; fill(blockedBox); inviteBox.hidden = true; fill(contacts); fill(quick); fill(invList); chatWrap.hidden = true; if (S.chatOff) { S.chatOff(); S.chatOff = null; } return; }
         if (!my) { statusP.textContent = 'V této skupině už nejsi členkou.'; nickRow.hidden = true; ned.box.hidden = true; err.hidden = true; fill(blockedBox); inviteBox.hidden = true; fill(contacts); fill(quick); fill(invList); chatWrap.hidden = true; if (S.chatOff) { S.chatOff(); S.chatOff = null; } return; }
         if (info.role !== my.status) { info.role = my.status; local.saveRoom({ id: roomId, role: my.status }); syncNotifier(); }
         if (prev !== my.status) { renderQuick(); if (!canChat() && S.chatOff) { S.chatOff(); S.chatOff = null; chatWrap.hidden = true; } }
@@ -1209,7 +1421,7 @@ async function initJoin(root) {
   addEventListener('hashchange', () => { if (/(?:^|[#&])t=/.test(location.hash)) location.reload(); });   // další odkaz otevřený ve stejné kartě
   const say = (cls, text, state) => fill(root, h('div', { class: cls, role: 'status', 'data-state': state, text }));
   // 1h: odhlášené zařízení (kód změněn jinde / ruční odhlášení) – žádný nový účet; obnova je v BAND APP → Kamarádky.
-  const signedOut = () => fill(root, h('div', { class: 'err', role: 'alert', 'data-state': 'signed-out', text: lockedReason() === 'manual' ? 'Jsi z tohoto zařízení odhlášená. Zpátky se dostaneš jen s obnovovacím kódem.' : CHANGED_TEXT }),
+  const signedOut = () => fill(root, h('div', { class: 'err', role: 'alert', 'data-state': 'signed-out', text: lockedReason() === 'manual' ? 'Jsi z tohoto zařízení odhlášená. Zpátky se dostaneš jen s obnovovacím kódem.' : 'Odhlášeno – obnov účet. Tento telefon není přihlášený ke svému účtu (nový kód na jiném zařízení nebo ztracené přihlášení). Zadej svůj obnovovací kód v BAND APP → Kamarádky.' }),
     h('a', { href: 'index.html' + location.search + '#friends', class: 'note', style: 'color:#ffb3ba', id: 'jRestoreLink', text: 'Zadat kód v BAND APP → Kamarádky' }));
   addEventListener(SIGNED_OUT_EVENT, () => { if (lockedReason()) signedOut(); });
   let token = '';
@@ -1227,7 +1439,20 @@ async function initJoin(root) {
   say('note', 'Ověřuji pozvánku…', 'loading');
   let fb, inv;
   try { fb = await connect(); inv = await getInvite(token); }
-  catch (e) { if (e && e.code === 'bandapp/signed-out') return signedOut(); return fill(root, h('div', { class: 'err', role: 'alert', 'data-state': 'error', text: 'Pozvánku se nepodařilo ověřit. ' + errText(e) }), btn('secondary', '↻ Zkusit znovu', () => location.reload())); }
+  catch (e) {
+    noteDiagErr('pozvánka', e); if (e && e.code === 'bandapp/signed-out') return signedOut();
+    // 1.2.3: nepřihlášený prohlížeč/aplikace → žádný samovolný účet; nabídnout obnovu nebo výslovně nový účet.
+    if (e && e.code === 'bandapp/no-account') return joinNoAccount(e.knownCode); return fill(root, h('div', { class: 'err', role: 'alert', 'data-state': 'error', text: 'Pozvánku se nepodařilo ověřit. ' + errText(e) }), btn('secondary', '↻ Zkusit znovu', () => location.reload())); }
+  // 1.2.2: tento účet už ve skupině je (třeba schválený dřív) → žádná nová žádost, jen obnovit skupinu v zařízení.
+  const roomOf = inv ? inv.roomId : null;
+  if (roomOf) {
+    const mine = await fb.F.getDocFromServer(fb.F.doc(fb.db, 'rooms', roomOf, 'members', fb.uid)).catch(() => null);
+    if (mine && mine.exists()) {
+      dropToken(); const st = String(mine.data().status || 'member');
+      const r = Object.assign({}, local.rooms().find(x => x.id === roomOf) || { id: roomOf, name: '', from: inv.fromNick }, { role: st }); local.saveRoom(r);
+      return roomView(r, 'V této skupině už členkou jsi (stejný účet jako dřív) – pozvánku nepotřebuješ. Skupina je zase v BAND APP.');
+    }
+  }
   if (!inv) { dropToken(); return say('err', 'Pozvánka neexistuje – byla zrušena nebo už vypršela.', 'missing'); }
   if (inv.used) {
     if (inv.usedBy === fb.uid) { const r = local.rooms().find(x => x.id === inv.roomId) || { id: inv.roomId, name: '', role: 'member', from: inv.fromNick }; local.saveRoom(r); return roomView(r); }
@@ -1239,30 +1464,62 @@ async function initJoin(root) {
   // 1g: jediná obrazovka – přezdívka + „Požádat o přijetí“. Žádné zaškrtávátko, nic dalšího se neukládá.
   const nick = h('input', { type: 'text', id: 'jNick', maxlength: 24, placeholder: 'Tvoje přezdívka', value: local.nick(), autocomplete: 'nickname' });
   const err = h('div', { class: 'err', role: 'alert', hidden: true });
+  let asTransfer = false;
   const accept = btn('primary', 'Požádat o přijetí', async () => {
     const n = cleanNick(nick.value);
     if (!n) { err.hidden = false; err.textContent = 'Napiš svou přezdívku.'; return; }
     accept.disabled = true; err.hidden = true;
     try {
-      await acceptInvite(token, inv.roomId, n);
+      try { await acceptInvite(token, inv.roomId, n); }
+      catch (e) { if (!(e && e.code === 'bandapp/already-member')) throw e; dropToken(); const r = { id: inv.roomId, name: '', role: e.status || 'member', from: inv.fromNick }; local.saveRoom(r); return roomView(r, errText(e)); }
       local.setNick(n); const r = { id: inv.roomId, name: '', role: 'pending', from: inv.fromNick }; local.saveRoom(r);
       dropToken();
-      roomView(r);
+      roomView(r, asTransfer ? 'Žádost o převod odeslána. Ukaž zakladatelce OSOBNĚ svůj kód účtu ' + (await deviceCode(fb.uid)) + ' – ona u tvého dřívějšího záznamu klepne na „🔁 Převést na nový účet…“ a kód opíše.' : undefined);
     } catch (e) {
-      err.hidden = false; err.textContent = 'Žádost se nepodařilo odeslat. ' + errText(e);
+      noteDiagErr('pozvánka', e); err.hidden = false; err.textContent = 'Žádost se nepodařilo odeslat. ' + errText(e);
       const final = ['bandapp/invite-used', 'bandapp/invite-missing'].includes(e && e.code);
       accept.disabled = final;
       if (final) dropToken();
     }
   }, { id: 'jAccept' });
+  // 1.2.4: stejná žádost, jen s návodem pro převod (pravidla beze změny – převod pak potvrdí zakladatelka osobně kódem).
+  const askMove = btn('secondary', '🔁 Mám nový účet – požádat o převod', () => { asTransfer = true; accept.click(); }, { id: 'jTransfer' });
+  const myCode = h('p', { class: 'note', id: 'jMyCode', text: 'Kód účtu tohoto telefonu: …' }); deviceCode(fb.uid).then(c => { myCode.textContent = 'Kód účtu tohoto telefonu: ' + c; });
   fill(root, 
     h('h2', { id: 'jTitle', 'data-state': 'invite' }, '✉️ Pozvánka od „', h('span', { text: inv.fromNick || 'kamarádka' }), '“'),
     h('label', { for: 'jNick', text: 'Tvoje přezdívka (ne celé jméno)' }), nick,
     err, h('div', { class: 'row' }, accept),
+    h('p', { class: 'note', text: 'Už ve skupině jsi, ale s jiným přihlášením (jiný telefon, Safari, smazaná data)? Napiš STEJNOU přezdívku a klepni na „Požádat o převod“. Zakladatelka pak u tvého dřívějšího záznamu převede členství na tento účet. Nic se nesmaže.' }),
+    myCode, h('div', { class: 'row' }, askMove),
     ...privacyLines('Odesláním žádosti přijímáš pravidla skupiny.'));
 
-  function roomView(r) {
+  async function joinNoAccount(known) {
+    const verified = await recoveryVerified();
+    const standalone = matchMedia('(display-mode: standalone)').matches;
+    const inp = h('input', { type: 'text', id: 'jRestoreCode', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'BAND-XXXX-XXXX-…', 'aria-label': 'Obnovovací kód', hidden: true });
+    const e3 = h('div', { class: 'err', role: 'alert', hidden: true });
+    const rgo = btn('primary', '♻️ Obnovit účet', async () => {
+      e3.hidden = true; if (!parseCode(inp.value)) { e3.hidden = false; e3.textContent = errText({ code: 'bandapp/bad-code' }); return; }
+      rgo.disabled = true;
+      try { const r = await restoreAccount(inp.value); inp.value = ''; flash(restoreText(r)); location.reload(); } catch (e) { rgo.disabled = false; e3.hidden = false; e3.textContent = errText(e); }
+    }, { id: 'jRestoreGo', hidden: true });
+    const copy = btn('secondary', '📋 Zkopírovat odkaz pozvánky', async () => { try { await navigator.clipboard.writeText(location.origin + location.pathname + location.search + '#t=' + token); copy.textContent = '✅ Zkopírováno – vlož ho v BAND APP'; } catch (e) { } }, { id: 'jCopyInvite' });
+    fill(root, h('h2', { id: 'jTitle', 'data-state': 'invite-no-account' }, '✉️ Pozvánka do BAND APP'),
+      standalone ? null : h('div', { class: 'warnbox', 'data-state': 'browser-not-app', text: '📱 Máš BAND APP nainstalovanou na ploše? Pak pozvánku otevři V NÍ, ne tady v prohlížeči – prohlížeč má jiné přihlášení, takže by ti hovory v aplikaci nechodily. Zkopíruj odkaz a v BAND APP ho vlož (VIDEOCHAT nebo Kamarádky → „Otevřít pozvánku tady“).' }),
+      standalone || !token ? null : h('div', { class: 'row' }, copy),
+      ...noAccountBlock({ known,
+        onRestore: verified ? () => { inp.hidden = false; rgo.hidden = false; inp.focus(); } : null,
+        onCreate: async () => { await createAccount(); location.reload(); },
+        createLabel: known ? '➕ Přesto založit NOVÝ účet' : (standalone ? '➕ Jsem tu poprvé – založit účet a pokračovat' : '➕ Jsem tu poprvé – založit účet v tomto prohlížeči') }),
+      inp, h('div', { class: 'row' }, rgo), e3);
+  }
+  function joinCode(uid) {   // 1.2.2: stejný kód vidí zakladatelka u členky a člen v BAND APP → Diagnostika hovorů
+    const el = h('p', { class: 'note', id: 'jDevCode', text: 'Kód účtu: …' });
+    deviceCode(uid).then(c => { el.textContent = 'Kód účtu: ' + (c || '–') + (matchMedia('(display-mode: standalone)').matches ? ' (nainstalovaná BAND APP)' : ' (tento prohlížeč)'); }); return el;
+  }
+  function roomView(r, notice) {
     fill(root, h('p', { class: 'note', text: 'Načítám…' }));
+    const noticeEl = () => notice ? h('div', { class: 'note', id: 'jAlready', 'data-state': /^Žádost o převod/.test(notice) ? 'transfer-requested' : 'already-member', text: '✅ ' + notice }) : null;
     // 1.1: „cur“ = vždy POSLEDNÍ stav vlastního záznamu (dřív si chat pamatoval přezdívku z prvního načtení).
     let chatOff = null, roomName = '', cur = null, asP = null;
     const ned = nickEditor(() => (cur && cur.nick) || local.nick(), () => { });
@@ -1270,9 +1527,10 @@ async function initJoin(root) {
       if (my === undefined) { if (!chatOff) say('note', 'Jsi offline. Kamarádky se připojí, až bude internet.', 'offline'); return; }
       if (!my) { if (chatOff) { chatOff(); chatOff = null; } local.dropRoom(r.id); return say('err', 'V této skupině nejsi (nebo už nejsi) členkou.', 'removed'); }
       if (r.role !== my.status) { r.role = my.status; local.saveRoom({ id: r.id, role: my.status }); }
+      if (my.status === 'replaced') { if (chatOff) { chatOff(); chatOff = null; } return say('err', REPLACED_TEXT, 'replaced'); }
       cur = my;
       if (my.status === 'pending') return fill(root, h('h2', { text: '⏳ Čekáš na schválení' }), h('p', { 'data-state': 'pending', text: 'Až tě ' + (r.from || 'zakladatelka skupiny') + ' schválí, otevře se tady chat. Stránku si ulož do záložek.' }),
-        h('p', { class: 'note', id: 'jMyNick', text: 'Tvoje přezdívka: ' + (my.nick || 'Kamarádka') }), h('div', { class: 'row' }, ned.button), ned.box);
+        h('p', { class: 'note', id: 'jMyNick', text: 'Tvoje přezdívka: ' + (my.nick || 'Kamarádka') }), noticeEl(), joinCode(fb.uid), h('div', { class: 'row' }, ned.button), ned.box);
       if (my.status === 'owner') {
         if (chatOff) { chatOff(); chatOff = null; }
         return fill(root, h('h2', { text: '👑 Jsi zakladatelka skupiny' }),
@@ -1282,12 +1540,16 @@ async function initJoin(root) {
       if (chatOff) { if (asP) asP.textContent = asText(); return; }
       const chat = h('div'), title = h('h2', { id: 'jRoomTitle', text: '💬 ' + (r.name || 'Skupina') });
       asP = h('p', { class: 'note', 'data-state': 'approved', id: 'jMyNick', text: asText() });
-      fill(root, title, asP, h('div', { class: 'row' }, ned.button), ned.box, chat,
+      // 1.2.5: cesta zpět do aplikace. Nainstalovaná BAND APP tu po otevření pozvánky zůstávala (hovory se volají
+      // z BAND APP → VIDEOCHAT). Příchozí hovory zvoní i tady (stránka teď načítá videochat.js). Žádné automatické přesměrování.
+      const openApp = h('div', { class: 'row', style: 'margin:8px 0' }, btn('primary', '📱 Otevřít BAND APP (Kamarádky a VIDEOCHAT)', () => { location.href = 'index.html' + location.search + '#videochat'; }, { id: 'jOpenApp' }));
+      const callNote = h('p', { class: 'note', id: 'jCallNote', text: 'Videohovory: volat můžeš v BAND APP → VIDEOCHAT. Příchozí hovor zazvoní i na této stránce, když je otevřená.' });
+      fill(root, title, asP, noticeEl(), openApp, callNote, joinCode(fb.uid), h('div', { class: 'row' }, ned.button), ned.box, chat,
         h('div', { class: 'row' },
           btn('secondary', 'Opustit skupinu', async () => { if (!confirm('Opravdu chceš opustit skupinu?')) return; try { await leaveRoom(r.id); } catch (e) { } })));
       chatOff = mountChat(chat, r.id, () => (cur && cur.nick) || my.nick, fb.uid);
       fb.F.getDoc(fb.F.doc(fb.db, 'rooms', r.id)).then(s => { if (s.exists()) { roomName = s.data().name || 'Skupina'; title.textContent = '💬 ' + roomName; local.saveRoom({ id: r.id, name: roomName }); } }).catch(() => { });
-    }, async e => { if (e && e.code === 'permission-denied' && !(await checkSession())) return; say('err', errText(e), 'error'); })).catch(e => { if (e && e.code === 'bandapp/signed-out') return signedOut(); say('err', errText(e), 'error'); });
+    }, async e => { if (e && e.code === 'permission-denied' && !(await checkSession())) return; say('err', errText(e), 'error'); })).catch(e => { if (e && e.code === 'bandapp/signed-out') return signedOut(); if (e && e.code === 'bandapp/no-account') return joinNoAccount(e.knownCode); say('err', errText(e), 'error'); });
   }
 }
 

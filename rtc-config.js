@@ -1,19 +1,26 @@
-/* BAND APP 1.2.0 (TEST) – nastavení spojení VIDEOCHATU (WebRTC). Tyto údaje NEJSOU tajné.
+/* BAND APP 1.2.0 – nastavení spojení VIDEOCHATU (WebRTC). Tento soubor je VEŘEJNÝ – nepatří sem žádná tajemství.
  *
  * STUN = veřejný bezplatný server Google. Jen pomůže telefonu zjistit vlastní veřejnou adresu;
  *        obraz ani zvuk přes něj NEJDE. Nic se neukládá.
  * TURN = přenosový server pro sítě, kde přímé spojení nejde (část mobilních operátorů, firemní/školní Wi-Fi).
- *        ZATÍM ŽÁDNÝ – vyžaduje schválení (placená nebo vlastní služba). Bez TURN se některé hovory nemusí spojit.
+ *        VÝCHOZÍ STAV: ŽÁDNÝ TURN. Aplikace funguje jen se STUN; když se spojení nenaváže,
+ * *        ukáže „Spojení se nepodařilo navázat (ICE selhalo) – pravděpodobně mobilní síť bez TURN serveru…“ (1.2.7).
  *        Přes TURN jde obraz a zvuk dál šifrovaně (DTLS-SRTP) – provozovatel TURN ho nevidí ani neslyší.
- *        NIKDY sem nevkládej trvalé uživatelské jméno a heslo TURN: soubor je veřejný. Správně jsou krátkodobé
- *        údaje (platné cca 1 h), které vydá malá služba – viz TURN_CREDENTIALS_URL.
+ *
+ * Zapnutí TURN (1.3.0, viz _tools/turn-worker/README.md):
+ *   TURN_CREDENTIALS_URL – adresa malé služby (Cloudflare Worker …/ice), která PŘIHLÁŠENÉ SCHVÁLENÉ člence dané
+ *                          skupiny vrátí JSON { iceServers: [...] }. Jméno a heslo k TURN (ExpressTURN Free) jsou
+ *                          uložené JEN jako tajemství (secret) ve Workeru – nikdy ne v tomto souboru ani na GitHubu.
+ *                          Při chybě/nedostupnosti služby se hovor zkusí bez TURN (jen STUN) a ukáže „TURN nedostupný“.
+ *                          V hlavní BAND APP zůstává prázdné, dokud TURN neotestujeme v náhledu.
+ *   STATIC_TURN_SERVERS  – pevné záznamy iceServers (např. vlastní server). NIKDY sem nevkládej jméno a heslo
+ *                          k TURN účtu – soubor si může přečíst kdokoli.
  */
 export const ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
 ];
-/* Budoucí rozšíření (po schválení): adresa služby, která přihlášené člence vrátí JSON { iceServers: [...] }
- * s krátkodobými TURN údaji. Prázdné = TURN vypnutý. */
-export const TURN_CREDENTIALS_URL = '';
+export const STATIC_TURN_SERVERS = [];
+export const TURN_CREDENTIALS_URL = 'https://bandapp-turn-test.holub5305.workers.dev/ice';   // NÁHLED: testovací Worker (TURN údaje jen jako jeho tajemství)
 /* Skupinový hovor = přímé propojení každé s každou (mesh). Nad 4 účastnice by telefony a mobilní data nestačily
  * (pravidla Firestore víc než 4 nepustí). Pro větší skupiny by byl potřeba server SFU – jen po schválení. */
 export const MAX_PARTICIPANTS = 4;

@@ -1,4 +1,4 @@
-/* BAND APP NÁHLED 1.2.0 – JEN v testovacím náhledu (repozitář band-app-preview-1p). NIKDY nenahrávat do band-app.
+/* BAND APP NÁHLED 1.3.0 – JEN v testovacím náhledu (repozitář band-app-preview-1p). NIKDY nenahrávat do band-app.
  * Náhled běží na stejné doméně holub5305-dotcom.github.io jako skutečná BAND APP, a prohlížeč proto obě stránky
  * nechává sdílet localStorage a IndexedDB. Tento soubor (načte se jako první) přesměruje VŠECHNA data náhledu
  * do vlastních jmen, takže náhled nevidí, nemění ani nemaže nahrávky, oblíbené kapely, lekce ani Kamarádky
@@ -24,7 +24,7 @@
   function banner() {
     if (document.getElementById('nahledBanner')) return;
     var b = document.createElement('div'); b.id = 'nahledBanner';
-    b.textContent = 'NÁHLED 1.2.0 – testovací verze (oddělená od BAND APP, data se nesdílí)';
+    b.textContent = 'NÁHLED 1.3.0 – testovací verze (oddělená od BAND APP, data se nesdílí)';
     b.style.cssText = 'position:sticky;top:0;z-index:50;background:#7a0010;color:#fff;font:600 13px/1.3 system-ui,sans-serif;text-align:center;padding:6px 8px';
     document.body.insertBefore(b, document.body.firstChild);
   }
